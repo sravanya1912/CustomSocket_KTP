@@ -1,0 +1,114 @@
+KTP — Emulating End-to-End Reliable Flow Control over Unreliable Channels
+=========================================================================
+
+1. Project objective
+-------------------
+Implement a message-oriented reliable transport (KTP) on top of UDP with
+window-based flow control, retransmission on timeout, and simulated packet loss.
+Applications use k_socket / k_bind / k_sendto / k_recvfrom / k_close linked
+against libksocket.a. Background service initksocket runs Thread R (receive),
+Thread S (send/timeout) and a garbage collector over POSIX shared memory.
+
+2. Architecture
+---------------
+  user1 / user2  --k_* API-->  libksocket.a  --shared memory / Unix FD pass-->
+       initksocket (Thread R, Thread S, GC)
+
+- Shared memory (shm_open / mmap) holds N=10 socket entries.
+- UDP file descriptors are created in the application and passed to init via
+  SCM_RIGHTS over a Unix-domain control socket (/tmp/ktp_ctrl.sock).
+- Thread R uses select() on all init-side UDP FDs, applies dropMessage(p),
+  processes DATA/ACK, updates buffers and windows.
+- Thread S wakes every ~100 ms, retransmits on timeout T=5 s, and sends
+  new pending messages within the advertised receiver window.
+- GC periodically checks owner PIDs with kill(pid,0) and reclaims dead entries.
+
+3. Packet format (12-byte header + payload)
+------------------------------------------
+  uint8_t  type;     /* PKT_DATA=1, PKT_ACK=2 */
+  uint8_t  seq;      /* data sequence number */
+  uint8_t  ack;      /* cumulative ACK */
+  uint8_t  rwnd;     /* advertised free receive slots */
+  uint16_t len;      /* payload length (network order) */
+  uint16_t flags;    /* bit0 = FIN (reserved) */
+  uint32_t checksum; /* simple sum over header+payload */
+Application messages are up to 512 bytes; header is prepended by the protocol.
+
+4. Shared-memory entry (ktp_sock_entry_t)
+----------------------------------------
+  allocated, pid, udp_fd_app, udp_fd_init, local/remote addr, bound
+  send_buf[50], send_head/tail/count, swnd, next_seq_to_send, total_tx/retrans
+  recv_buf[10], recv_count, rwnd, expected_seq, next_deliver, nospace,
+  last_ack_sent, need_window_update, process-shared mutex
+
+5. Public API (ksocket.c)
+-------------------------
+  k_socket(domain, SOCK_KTP, proto)  – allocate SM slot, create UDP, pass FD
+  k_bind(fd, src_ip, src_port, dest_ip, dest_port)
+  k_sendto(...)  – enqueue 512-byte message; ENOTBOUND / ENOSPACE
+  k_recvfrom(...) – dequeue next in-order message; ENOMESSAGE if none
+  k_close(fd)    – free slot
+  dropMessage(p) – return 1 with probability p (called in Thread R)
+
+6. Sequence numbers
+-------------------
+8-bit, start at 1, modular arithmetic. Window size 10 << 128, so seq_lt /
+seq_in_window distinguish directions safely across the 255→0 boundary.
+
+7. nospace flag problem and fix
+-------------------------------
+When the receive buffer is full, R sets nospace and advertises rwnd=0.
+When the application drains messages, k_recvfrom sets need_window_update.
+Thread R (on select timeout or after packet processing) sends a duplicate
+ACK carrying the new rwnd. If that ACK is lost, the sender would stay blocked.
+
+Fix implemented:
+  - need_window_update is sticky until an ACK is actually sent from R.
+  - On every select timeout R re-checks nospace/need_window_update and
+    retransmits a window-update ACK.
+  - Sender timeout retransmits outstanding data, which also elicits ACKs
+    that carry the current rwnd, providing a second recovery path.
+
+8. Build and run
+----------------
+  make all
+  # binaries must be run from a filesystem that allows execution (e.g. /tmp)
+  cp initksocket user1 user2 /tmp && chmod +x /tmp/initksocket /tmp/user*
+  /tmp/initksocket &
+  /tmp/user2 127.0.0.1 5001 127.0.0.1 5000 /tmp/out.bin &
+  /tmp/user1 127.0.0.1 5000 127.0.0.1 5001 /path/to/file.bin
+  sha256sum file.bin /tmp/out.bin
+  # stop: kill the initksocket process; it unlinks shm and control socket
+
+9. Packet-loss experiment table
+-------------------------------
+(Measured on loopback with the implementation as of submission.)
+
+  p     | file size | msgs | data_tx | retrans | avg_tx/msg | success | notes
+  ------|-----------|------|---------|---------|------------|---------|------
+  0.00  | 122880    | 240  |  ~240   |  0      | ~1.0       | partial*| see known issues
+  0.05  | —         | —    | —       | —       | —          | NOT RUN |
+  0.10  | —         | —    | —       | —       | —          | NOT RUN |
+  ...   | —         | —    | —       | —       | —          | NOT RUN |
+  0.50  | —         | —    | —       | —       | —          | NOT RUN |
+
+* With p=0, a 120 KiB transfer delivered 232/240 messages in one run
+  (118784 bytes). Remaining gap is under investigation (possible UDP
+  socket buffer overflow under burst or an ACK race). Increase
+  SO_RCVBUF/SO_SNDBUF or reduce Thread-S aggressiveness if needed.
+
+10. Known limitations
+---------------------
+- Full multi-socket stress tests and complete p-sweep not executed in the
+  build environment (tool timeouts / noexec mount on project dir).
+- Final few messages of a large transfer occasionally missing; treat as
+  a bug to harden before viva (socket buffer sizes, stricter end-of-transfer
+  handshake with FIN flag).
+- user2 uses idle-timeout completion rather than an explicit FIN from user1.
+- Descriptor sharing requires initksocket to be running before k_socket.
+
+11. Files submitted
+-------------------
+  ksocket.h, ksocket.c, initksocket.c, user1.c, user2.c
+  Makefile, documentation.txt, README.md
+  (libksocket.a generated by `make library`)
